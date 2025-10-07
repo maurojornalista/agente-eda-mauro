@@ -1,108 +1,105 @@
-# llm_client.py — cliente LLM multi-provider (Gemini, Groq, OpenAI)
+# llm_client.py — cliente LLM (Gemini em 1º), com OpenAI opcional
 import os
 from typing import Optional
 
-from dotenv import load_dotenv
-load_dotenv()
+# Em dev/local, .env ajuda; no Render, as env vars já vêm do painel
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
-# Status
+# --- Flags / estado ---
 _loaded = False
 _has_openai = False
 _has_gemini = False
-_has_groq = False
 
 _openai_client = None
-_gemini_model = None
-_groq_client = None
+_gemini_client = None
+_gemini_model_name = None  # guarda o nome realmente usado
 
+# Modelos (podem ser sobrescritos via env)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-70b-versatile")
+# Use um modelo válido da API recente:
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-pro-preview-03-25")
 
 
 def _lazy_load():
-    global _loaded, _has_openai, _has_gemini, _has_groq
-    global _openai_client, _gemini_model, _groq_client
+    """Carrega clientes uma única vez, de forma segura em produção."""
+    global _loaded, _has_openai, _has_gemini
+    global _openai_client, _gemini_client, _gemini_model_name
+
     if _loaded:
-        print("Status final do lazy_load: Groq =", _has_groq)
         return
 
-    # OpenAI
+    # ---------- OpenAI (opcional) ----------
     try:
         from openai import OpenAI
-        key = os.getenv("OPENAI_API_KEY")
-        if key:
-            _openai_client = OpenAI(api_key=key)
+        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if openai_key:
+            _openai_client = OpenAI(api_key=openai_key)
             _has_openai = True
-    except Exception:
+    except Exception as e:
         _has_openai = False
+        print(f"[OpenAI] desativado: {e}")
 
-    # Gemini
-    # Gemini
-try:
-    import google.generativeai as genai
-    key = os.getenv("GOOGLE_API_KEY")
-    if key:
-        genai.configure(api_key=key)
-        # tenta modelo do .env e faz fallback para aliases válidos
-        prefer = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest")
-        candidates = [prefer, "gemini-1.5-flash-latest",
-                      "gemini-1.5-pro-latest"]
-        model_obj = None
-        last_err = None
-        for name in candidates:
-            try:
-                model_obj = genai.GenerativeModel(name)
-                # smoke call leve para validar
-                _ = model_obj.generate_content("ok")
-                _gemini_model = model_obj
-                _has_gemini = True
-                break
-            except Exception as e:
-                last_err = e
-        if not _has_gemini:
-            print(f"[GEMINI] Falhou ao inicializar. Último erro: {last_err}")
-except Exception as e:
-    _has_gemini = False
-    print(f"[GEMINI] Erro de import/config: {e}")
-
-    # Groq
-    # try:
-    #   from groq import Groq
-    #  key = os.getenv("GROQ_API_KEY")
-    # if key:
-    #    _groq_client = Groq(api_key=key)
-    #   _has_groq = True
-    # except Exception:
-    #   _has_groq = False
+    # ---------- Gemini (principal) ----------
+    try:
+        import google.generativeai as genai
+        gkey = os.getenv("GOOGLE_API_KEY", "").strip()
+        if gkey:
+            genai.configure(api_key=gkey)
+            # Tenta na ordem: env > fallback(s)
+            candidates = [
+                GEMINI_MODEL,  # do env se existir
+                "models/gemini-2.5-pro-preview-03-25",
+                "models/gemini-1.5-flash",
+            ]
+            last_err = None
+            for name in candidates:
+                try:
+                    _gemini_client = genai.GenerativeModel(name)
+                    _gemini_model_name = name
+                    _has_gemini = True
+                    break
+                except Exception as e:
+                    last_err = e
+            if not _has_gemini:
+                print(
+                    f"[GEMINI] Falhou ao criar modelo. Último erro: {last_err}")
+        else:
+            print("[GEMINI] GOOGLE_API_KEY vazia/ausente.")
+    except Exception as e:
+        _has_gemini = False
+        print(f"[GEMINI] Erro import/config: {e}")
 
     _loaded = True
 
 
 def available() -> bool:
     _lazy_load()
-    return _has_openai or _has_gemini or _has_groq
+    return _has_gemini or _has_openai
 
 
 def ask_llm(prompt: str, system: Optional[str] = None, max_tokens: int = 220) -> str:
     """
-    Envia o prompt para o primeiro provedor LLM disponível.
-    Prioridade: GEMINI > OPENAI > GROQ
+    Envia o prompt para o primeiro provedor disponível.
+    Prioridade: GEMINI > OPENAI
     """
     _lazy_load()
     sys_msg = system or "Você é um assistente de EDA. Responda em português, de forma útil e direta."
 
-    # 1️⃣ Gemini primeiro
-    if _has_gemini:
+    # 1) Gemini
+    if _has_gemini and _gemini_client is not None:
         try:
             content = f"{sys_msg}\n\nUsuário:\n{prompt}"
-            resp = _gemini_model.generate_content(content)
+            resp = _gemini_client.generate_content(content)
             return (getattr(resp, "text", "") or "").strip()
         except Exception as e:
             print(f"[ERRO Gemini] {e}")
 
-    # 2️⃣ Depois OpenAI
-    if _has_openai:
+    # 2) OpenAI
+    if _has_openai and _openai_client is not None:
         try:
             resp = _openai_client.chat.completions.create(
                 model=OPENAI_MODEL,
@@ -117,31 +114,15 @@ def ask_llm(prompt: str, system: Optional[str] = None, max_tokens: int = 220) ->
         except Exception as e:
             print(f"[ERRO OpenAI] {e}")
 
-    # 3️⃣ Por último Groq
-    if _has_groq:
-        try:
-            resp = _groq_client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {"role": "system", "content": sys_msg},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-                max_tokens=max_tokens,
-            )
-            return (resp.choices[0].message.content or "").strip()
-        except Exception as e:
-            print(f"[ERRO Groq] {e}")
-
-    # Nenhum provedor funcionou
+    # nenhum provedor
     return "⚠️ Nenhum provedor LLM pôde responder no momento."
 
 
 def debug_status() -> str:
     _lazy_load()
+    gem_model = _gemini_model_name or GEMINI_MODEL
     return (
         f"LLM disponível? {available()}\n"
         f"OpenAI: {_has_openai} (modelo={OPENAI_MODEL})\n"
-        f"Gemini: {_has_gemini} (modelo={GEMINI_MODEL})\n"
-        f"Groq:   {_has_groq} (modelo={GROQ_MODEL})"
+        f"Gemini: {_has_gemini} (modelo={gem_model})"
     )
